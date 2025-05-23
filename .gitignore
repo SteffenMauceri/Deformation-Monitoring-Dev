@@ -106,3 +106,8 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+/benchmark_results
+/dataset/phaseUnwrapping
+/dataset/phaseUnwrapping
+loss_histogram_phaseUnwrapping_interf.png
+loss_histogram_phaseUnwrapping_origin.png

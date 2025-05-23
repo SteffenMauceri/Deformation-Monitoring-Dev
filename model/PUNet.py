@@ -90,4 +90,4 @@ class PUNet(nn.Module):
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = PUNet(num_channels=1).to(device)
-    summary(model,(1,180,180))
+    summary(model,(1,256,256))

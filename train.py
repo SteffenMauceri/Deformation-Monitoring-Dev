@@ -14,6 +14,9 @@ from argparse import ArgumentParser
 from builders.model_builder import build_model
 from builders.dataset_builder import build_dataset_train
 from utils.utils import setup_seed, init_weight, netParams
+from torch.utils.tensorboard import SummaryWriter
+# Import the denormalization function
+from dataset.phaseUnwrapping import denormalize_label
 
 
 sys.setrecursionlimit(1000000)  # solve problem 'maximum recursion depth exceeded'
@@ -33,16 +36,16 @@ def parse_args():
     parser.add_argument('--dataRootDir', type=str, default=r"dataset",
                         help="dataset dir")
     parser.add_argument('--dataset', type=str, default="phaseUnwrapping", help="dataset")
-    parser.add_argument('--input_size', type=str, default="180,180", help="input size of model")
-    parser.add_argument('--num_workers', type=int, default=1, help=" the number of parallel threads")
+    parser.add_argument('--input_size', type=str, default="256,256", help="input size of model")
+    parser.add_argument('--num_workers', type=int, default=4, help=" the number of parallel threads")
     parser.add_argument('--num_channels', type=int, default=1,
                         help="the num_channels ")
     # training hyper params
-    parser.add_argument('--max_epochs', type=int, default=300,
+    parser.add_argument('--max_epochs', type=int, default=500,
                         help="the number of epochs")
     parser.add_argument('--random_mirror', type=bool, default=True, help="input image random mirror")
-    parser.add_argument('--lr', type=float, default=1e-3, help="initial learning rate")
-    parser.add_argument('--batch_size', type=int, default=2, help="the batch size is set to 16 for 2 GPUs")
+    parser.add_argument('--lr', type=float, default=1e-4, help="initial learning rate")
+    parser.add_argument('--batch_size', type=int, default=5, help="the batch size is set to 16 for 2 GPUs")
     parser.add_argument('--optim', type=str.lower, default='adam', choices=['sgd', 'adam'],
                         help="select optimizer")
     parser.add_argument('--poly_exp', type=float, default=0.95, help='polynomial LR exponent')
@@ -70,11 +73,21 @@ def train_model(args):
 
     print(args)
 
+    device = "cpu" # Default to CPU
     if args.cuda:
-        print("=====> use gpu id: '{}'".format(args.gpus))
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
-        if not torch.cuda.is_available():
-            raise Exception("No GPU found or Wrong gpu id, please run without --cuda")
+        if torch.cuda.is_available():
+            print("=====> use gpu id: '{}'".format(args.gpus))
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+            device = "cuda"
+        elif torch.backends.mps.is_available(): # Check for MPS
+            print("=====> using Apple Metal Performance Shaders (MPS)")
+            device = "mps"
+        else:
+            print("=====> No GPU (CUDA or MPS) available/selected, running on CPU")
+            # Optionally raise an exception if GPU was explicitly requested but none found
+            # raise Exception("GPU specified but no CUDA or MPS found, please run without --cuda or check setup")
+    else:
+        print("=====> Running on CPU")
 
     # set the seed
     setup_seed(GLOBAL_SEED)
@@ -106,20 +119,29 @@ def train_model(args):
         raise NotImplementedError(
             "not support dataset: %s" % args.dataset)
 
-    if args.cuda:
-        criteria = criteria.cuda()
-        if torch.cuda.device_count() > 1:
-            print("torch.cuda.device_count()=", torch.cuda.device_count())
-            args.gpu_nums = torch.cuda.device_count()
-            model = nn.DataParallel(model).cuda()  # multi-card data parallel
-        else:
-            args.gpu_nums = 1
-            print("single GPU for training")
-            model = model.cuda()  # 1-card data parallel
+    # Move model and criteria to the selected device
+    model = model.to(device)
+    criteria = criteria.to(device)
 
-    args.savedir = (args.savedir + args.dataset + '/' + args.model + 'bs'
+    if device == "cuda" and torch.cuda.device_count() > 1: # Specific multi-GPU handling for CUDA
+        print("torch.cuda.device_count()=", torch.cuda.device_count())
+        args.gpu_nums = torch.cuda.device_count()
+        model = nn.DataParallel(model) # .cuda() is implicitly handled by .to(device) now
+        args.savedir = (args.savedir + args.dataset + '/' + args.model + 'bs'
                     + str(args.batch_size) + 'gpu' + str(args.gpu_nums) + '/')
+    elif device != "cpu": # Single GPU (CUDA or MPS) or MPS
+        args.gpu_nums = 1
+        print(f"=====> Using single {device.upper()} device for training")
+        args.savedir = (args.savedir + args.dataset + '/' + args.model + 'bs'
+                    + str(args.batch_size) + device.lower() + str(args.gpu_nums) + '/')
+    else: # CPU
+        args.savedir = (args.savedir + args.dataset + '/' + args.model + 'bs'
+                    + str(args.batch_size) + 'cpu/')
     os.makedirs(args.savedir,exist_ok=True)
+
+    # TensorBoard Writer
+    tb_log_dir = os.path.join(args.savedir, 'runs') # Define a subdirectory for TensorBoard logs
+    writer = SummaryWriter(log_dir=tb_log_dir)
 
     start_epoch = 0
 
@@ -153,7 +175,7 @@ def train_model(args):
     else:
         logger = open(logFileLoc, 'w')
         logger.write("Parameters: %s Seed: %s" % (str(total_paramters), GLOBAL_SEED))
-        logger.write("\n%s\t%s\t\t%s\t%s\t%s" % ('Epoch', 'lr', 'Loss(Tr)', 'RMSE (val)', 'MAE(val)'))
+        logger.write("\n%s\t%s\t\t%s\t%s\t\t%s\t%s" % ('Epoch', 'lr', 'Loss(Tr)', 'Loss(Val)', 'RMSE (val)', 'MAE(val)'))
     logger.flush()
 
     # define optimization strategy
@@ -172,30 +194,47 @@ def train_model(args):
     epoches = []
     mRMSE_val_list = []
 
+    # Initialize the learning rate scheduler once
+    lambda1 = lambda epoch: math.pow((1 - (epoch / args.max_epochs)), args.poly_exp)
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda1)
+
     print('=====> beginning training')
     for epoch in range(start_epoch, args.max_epochs):
         # training
-        lossTr, lr = train(args, trainLoader, model, criteria, optimizer, epoch)
+        lossTr, lr = train(args, trainLoader, model, criteria, optimizer, epoch, device)
         lossTr_list.append(lossTr)
 
         # validation
         if epoch % 1 == 0 or epoch == (args.max_epochs - 1):
             epoches.append(epoch)
-            rmse, mae= val(args, valLoader, model)
+            rmse, mae, val_loss = val(args, valLoader, model, device, criteria)
             mRMSE_val_list.append(rmse)
             # record train information
-            logger.write("\n%d\t%.7f\t%.4f\t\t%.4f\t\t%.4f" % (epoch, lr, lossTr, rmse, mae))
+            logger.write("\n%d\t%.7f\t%.4f\t\t%.4f\t\t%.4f\t\t%.4f" % (epoch, lr, lossTr, val_loss, rmse, mae))
             logger.flush()
             print("Epoch : " + str(epoch) + ' Details')
-            print("Epoch No.: %d\tTrain Loss = %.4f\t mRMSE(val) = %.4f\t lr= %.6f\n" % (epoch,
+            print("Epoch No.: %d\tTrain Loss = %.4f\tVal Loss = %.4f\tmRMSE(val) = %.4f\t lr= %.6f\n" % (epoch,
                                                                                         lossTr,
+                                                                                        val_loss,
                                                                                         rmse, lr))
+            # TensorBoard logging
+            writer.add_scalar('Loss/train', lossTr, epoch)
+            writer.add_scalar('Loss/validation', val_loss, epoch)
+            writer.add_scalar('RMSE/validation', rmse, epoch)
+            writer.add_scalar('MAE/validation', mae, epoch)
+            writer.add_scalar('Learning_Rate', lr, epoch)
         else:
             # record train information
             logger.write("\n%d\t%.7f\t%.4f" % (epoch,lr, lossTr))
             logger.flush()
             print("Epoch : " + str(epoch) + ' Details')
             print("Epoch No.: %d\tTrain Loss = %.4f\t lr= %.6f\n" % (epoch, lossTr, lr))
+            # TensorBoard logging (for epochs where validation isn't run)
+            writer.add_scalar('Loss/train', lossTr, epoch)
+            writer.add_scalar('Learning_Rate', lr, epoch)
+
+        # Step the scheduler once per epoch, after validation
+        scheduler.step()
 
         # save the model
         if epoch % 1 == 0 or epoch == (args.max_epochs - 1):
@@ -205,9 +244,10 @@ def train_model(args):
             print("Model saved: %s" % model_file_name)
 
     logger.close()
+    writer.close() # Close the TensorBoard writer
 
 
-def train(args, train_loader, model, criterion, optimizer, epoch):
+def train(args, train_loader, model, criterion, optimizer, epoch, device):
     """
     args:
        train_loader: loaded for training dataset
@@ -230,29 +270,29 @@ def train(args, train_loader, model, criterion, optimizer, epoch):
         args.max_iter = args.max_epochs * args.per_iter
         args.cur_iter = epoch * args.per_iter + iteration
         # learming scheduling
-        lambda1 = lambda epoch: math.pow((1 - (args.cur_iter / args.max_iter)), args.poly_exp)
-        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda1)
+        # lambda1 = lambda epoch: math.pow((1 - (args.cur_iter / args.max_iter)), args.poly_exp)
+        # scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda1)
 
         lr = optimizer.param_groups[0]['lr']
 
         start_time = time.time()
-        images, labels, _, _ = batch
+        images, labels, _, names = batch # Unpack names
 
-        if torch_ver == '0.3':
-            images = Variable(images).cuda()
-            labels = Variable(labels).cuda()
-        else:
-            images = images.cuda()
-            labels = labels.cuda()
+        # Move data to the selected device
+        images = images.to(device)
+        labels = labels.to(device)
 
         output = model(images)
 
         loss = criterion(output, labels)
 
+        if loss.item() > 1000000: # Add this check
+            print(f"High loss detected: {loss.item()} in batch with files: {names}")
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        scheduler.step()  # In pytorch 1.1.0 and later, should call 'optimizer.step()' before 'lr_scheduler.step()'
+        # scheduler.step()  # In pytorch 1.1.0 and later, should call 'optimizer.step()' before 'lr_scheduler.step()'
         epoch_loss.append(loss.item())
         time_taken = time.time() - start_time
 
@@ -271,33 +311,50 @@ def train(args, train_loader, model, criterion, optimizer, epoch):
     return average_epoch_loss_train, lr
 
 
-def val(args, val_loader, model):
+def val(args, val_loader, model, device, criterion):
     """
     args:
       val_loader: loaded for validation dataset
       model: model
-    return: mean rmses
+      device: device to run on
+      criterion: loss function
+    return: mean rmses, mean maes, average validation loss
     """
     # evaluation mode
     model.eval()
     total_batches = len(val_loader)
+    epoch_val_loss = [] # To store batch losses
 
     rmses = 0
     maes = 0
     for i, (input, label, size, name) in enumerate(val_loader):
         start_time = time.time()
         with torch.no_grad():
-            input_var = input.cuda()
+            # Move data to the selected device
+            input_var = input.to(device)
+            # label_var is already normalized by the DataLoader
+            label_var = label.to(device) 
             output = model(input_var)
+            
+            loss = criterion(output, label_var) # Loss is calculated on normalized output vs normalized label
+            epoch_val_loss.append(loss.item())
+
         time_taken = time.time() - start_time
         print("[%d/%d]  time: %.2f" % (i + 1, total_batches, time_taken))
-        output = output.cpu().numpy()
-        gt = np.asarray(label.numpy(), dtype=np.uint8)
+        
+        # Denormalize output and label for metrics calculation
+        output_denorm = denormalize_label(output.cpu().numpy())
+        # The label from val_loader is already normalized, so we need to get the original gt for metrics.
+        # This is tricky as the original label isn't directly passed. 
+        # For now, we'll denormalize the normalized label_var for metric calculation.
+        # This assumes criterion works on normalized values, and metrics on denormalized.
+        gt_denorm = denormalize_label(label_var.cpu().numpy())
 
-        rmses += np.sqrt(np.mean((output - gt) ** 2))
-        maes += np.mean(np.abs(output - gt))
-
-    return rmses/(i+1), maes/(i+1)
+        rmses += np.sqrt(np.mean((output_denorm - gt_denorm) ** 2))
+        maes += np.mean(np.abs(output_denorm - gt_denorm))
+    
+    average_val_loss = sum(epoch_val_loss) / len(epoch_val_loss) # Calculate average loss
+    return rmses/(i+1), maes/(i+1), average_val_loss
 
 
 if __name__ == '__main__':
